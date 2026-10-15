@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Blob Workshop VR</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>
+:root{--bg:rgba(30,27,60,.9);--fg:#fff;--ac:#ff5c8a;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+html,body{margin:0;height:100%;overflow:hidden;background:#8fd3ff;font:13px system-ui,sans-serif}
+canvas{display:block;touch-action:none}
+#hud{position:absolute;top:calc(8px + env(safe-area-inset-top,0px));left:8px;width:230px;max-height:calc(100% - 24px);overflow-y:auto;background:var(--bg);color:var(--fg);border-radius:14px;padding:10px}
+#hud button{background:#3d3a6b;color:var(--fg);border:0;border-radius:8px;padding:6px 8px;margin:2px;cursor:pointer}
+#hud button.on{background:var(--ac)}#hud button:disabled{opacity:.5}
+#hud input,#hud select{max-width:100%;box-sizing:border-box}
+#pal span{display:inline-block;width:20px;height:20px;border-radius:50%;margin:2px;cursor:pointer;border:2px solid #fff}
+#msg{margin-top:6px;color:#ffd166}
+#help{position:absolute;bottom:8px;right:8px;color:#123;background:rgba(255,255,255,.7);padding:6px 10px;border-radius:10px;font-size:12px}
+</style></head><body>
+<div id="hud"><b style="font-size:16px">Blob Workshop</b>
+<div id="tools"></div><div id="acts"></div>
+<div>Color <input type="color" id="col" value="#ff5c8a"></div><div id="pal"></div>
+<label>Brush <input type="range" id="br" min="5" max="80" value="20"></label><br>
+<label><input type="checkbox" id="sn" checked> Snap to grid</label><br>
+<label>Volume <input type="range" id="vol" min="0" max="100" value="50"></label>
+<div style="margin-top:6px"><input id="nm" value="my-project"> <select id="sv"></select></div>
+<div id="files"></div><button id="vr" disabled>Checking VR…</button><div id="msg"></div>
+<input type="file" id="imp" accept=".json" hidden></div>
+<div id="help">Desktop: click to place/select · drag to move · right-drag orbit · wheel zoom<br>VR: trigger = use tool / press panel · grip = grab &amp; throw</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const T=THREE,$=id=>document.getElementById(id);
+const msg=t=>{$('msg').textContent=t};
+// ---------- audio ----------
+let AC,vol=.5;
+function beep(f=440,d=.08,ty='sine',g=.2,sl=0){if(!vol)return;try{AC=AC||new(window.AudioContext||webkitAudioContext)();const n=AC.currentTime,o=AC.createOscillator(),a=AC.createGain();o.type=ty;o.frequency.setValueAtTime(f,n);if(sl)o.frequency.exponentialRampToValueAtTime(Math.max(30,f+sl),n+d);a.gain.setValueAtTime(g*vol,n);a.gain.exponentialRampToValueAtTime(.001,n+d);o.connect(a);a.connect(AC.destination);o.start();o.stop(n+d)}catch(e){}}
+// ---------- scene ----------
+const R=new T.WebGLRenderer({antialias:true});R.setPixelRatio(Math.min(devicePixelRatio,2));R.setSize(innerWidth,innerHeight);R.xr.enabled=true;R.shadowMap.enabled=true;document.body.prepend(R.domElement);
+const S=new T.Scene();S.background=new T.Color(0x8fd3ff);S.fog=new T.Fog(0x8fd3ff,25,70);
+const cam=new T.PerspectiveCamera(65,innerWidth/innerHeight,.05,120),rig=new T.Group();rig.add(cam);S.add(rig);
+S.add(new T.HemisphereLight(0xffffff,0x88aa88,.9));
+const sun=new T.DirectionalLight(0xffffff,.8);sun.position.set(4,8,3);sun.castShadow=true;sun.shadow.mapSize.set(1024,1024);Object.assign(sun.shadow.camera,{left:-8,right:8,top:8,bottom:-8});S.add(sun);
+const floorM=new T.Mesh(new T.CircleGeometry(30,48),new T.MeshStandardMaterial({color:0xbfe8a8}));floorM.rotation.x=-Math.PI/2;floorM.receiveShadow=true;S.add(floorM);
+S.add(Object.assign(new T.GridHelper(8,80,0xffffff,0xdff5d0),{position:new T.Vector3(0,.002,0)}));
+for(let i=0;i<14;i++){const a=i*.9,r=9+i%4*3,m=new T.Mesh(i%2?new T.ConeGeometry(.8,2+i%3,16):new T.SphereGeometry(1+i%3*.4,20,14),new T.MeshStandardMaterial({color:new T.Color().setHSL(i/14,.7,.65)}));m.position.set(Math.cos(a)*r,i%2?1:1.2,Math.sin(a)*r);m.castShadow=true;S.add(m)}
+const world=new T.Group();S.add(world);
+// camera orbit (desktop)
+let yaw=0,pit=.35,dist=3.2;const tgt=new T.Vector3(0,.8,0);
+function orbit(){if(R.xr.isPresenting)return;cam.position.set(tgt.x+dist*Math.cos(pit)*Math.sin(yaw),tgt.y+dist*Math.sin(pit),tgt.z+dist*Math.cos(pit)*Math.cos(yaw));cam.lookAt(tgt)}
+// ---------- state ----------
+const items=[],anims=[],hist=[],redoS=[];
+const PAL=['#ff5c8a','#ffb703','#8ecae6','#06d6a0','#9b5de5','#ffffff','#2b2d42','#fb8500'];
+let tool='sphere',color=PAL[0],brush=.02,sel=null,hov=null,snapOn=true;
+const TOOLS=[['sphere','Sphere'],['cube','Cube'],['capsule','Capsule'],['cylinder','Cyl'],['blob','Blob'],['draw','Draw'],['select','Move'],['delete','Delete'],['recolor','Color'],['dup','Copy']];
+const TYPES=['sphere','cube','capsule','cylinder','blob','draw'];
+const push=(u,r)=>{hist.push({u,r});redoS.length=0};
+const undo=()=>{const a=hist.pop();if(a){a.u();redoS.push(a);beep(300,.1)}};
+const redo=()=>{const a=redoS.pop();if(a){a.r();hist.push(a);beep(500,.1)}};
+function glow(o){if(o)o.material.emissive.setHex(o===sel?0x444444:o===hov?0x222222:0)}
+function select(o){const p=sel;sel=o;glow(p);glow(o)}
+// ---------- shapes ----------
+function make(t,d){let g;
+ if(t==='sphere')g=new T.SphereGeometry(.15,24,16);
+ else if(t==='cube')g=new T.BoxGeometry(.25,.25,.25);
+ else if(t==='cylinder')g=new T.CylinderGeometry(.12,.12,.3,24);
+ else if(t==='capsule'){const p=[];for(let i=0;i<=8;i++){const a=-Math.PI/2+i/8*Math.PI/2;p.push(new T.Vector2(Math.cos(a)*.1,Math.sin(a)*.1-.1))}for(let i=0;i<=8;i++){const a=i/8*Math.PI/2;p.push(new T.Vector2(Math.cos(a)*.1,Math.sin(a)*.1+.1))}g=new T.LatheGeometry(p,20)}
+ else if(t==='blob'){g=new T.SphereGeometry(.17,32,24);const p=g.attributes.position,v=new T.Vector3(),s=d.seed||1;for(let i=0;i<p.count;i++){v.fromBufferAttribute(p,i).normalize();const k=1+.18*Math.sin(v.x*3+s)*Math.cos(v.y*3+s*2)+.1*Math.sin(v.z*5+s*3);p.setXYZ(i,v.x*.17*k,v.y*.17*k,v.z*.17*k)}g.computeVertexNormals()}
+ else g=new T.TubeGeometry(new T.CatmullRomCurve3(d.pts.map(a=>new T.Vector3(...a))),Math.min(200,d.pts.length*3),d.r,8);
+ const m=new T.Mesh(g,new T.MeshStandardMaterial({color:d.c,roughness:.4,metalness:.05}));m.castShadow=true;
+ m.userData={t,c:d.c,seed:d.seed,pts:d.pts,r:d.r,v:new T.Vector3()};return m}
+function add(m,rec=true){world.add(m);if(!items.includes(m))items.push(m);const s=m.scale.clone();anims.push({m,s,t:0});if(rec)push(()=>rm(m,false),()=>add(m,false));select(m);beep(520+Math.random()*200,.1,'triangle',.2,300)}
+function rm(m,rec=true){world.remove(m);const i=items.indexOf(m);if(i>=0)items.splice(i,1);if(sel===m)sel=null;if(hov===m)hov=null;if(rec){push(()=>add(m,false),()=>rm(m,false));beep(250,.15,'sawtooth',.15,-120)}}
+const snapT=o=>({p:o.position.clone(),q:o.quaternion.clone(),s:o.scale.clone()});
+const applyT=(o,s)=>{o.position.copy(s.p);o.quaternion.copy(s.q);o.scale.copy(s.s);o.userData.dyn=false};
+function xf(o,fn){if(!o)return;const a=snapT(o);fn(o);const b=snapT(o);push(()=>applyT(o,a),()=>applyT(o,b));beep(400,.06)}
+function recolor(o,c){const old=o.userData.c,set=v=>{o.userData.c=v;o.material.color.set(v)};set(c);push(()=>set(old),()=>set(c));beep(660,.08)}
+function dup(o){const m=make(o.userData.t,o.userData);m.userData.c=o.userData.c;m.position.copy(o.position).add(new T.Vector3(.2,0,.2));m.quaternion.copy(o.quaternion);m.scale.copy(o.scale);add(m)}
+// ---------- freehand strokes ----------
+let stroke=null;
+const beginStroke=()=>{stroke={pts:[],mesh:null}};
+function strokeAdd(v){const l=stroke.pts[stroke.pts.length-1];if(l&&l.distanceTo(v)<.012)return;stroke.pts.push(v.clone());if(stroke.pts.length>1&&stroke.pts.length%3===0){const g=new T.TubeGeometry(new T.CatmullRomCurve3(stroke.pts),Math.min(200,stroke.pts.length*3),brush,8);if(stroke.mesh){stroke.mesh.geometry.dispose();stroke.mesh.geometry=g}else{stroke.mesh=new T.Mesh(g,new T.MeshStandardMaterial({color,roughness:.4}));S.add(stroke.mesh)}if(stroke.pts.length%12===0)beep(700+stroke.pts.length*3,.04,'sine',.08)}}
+function endStroke(){const s=stroke;stroke=null;if(!s)return;if(s.mesh){S.remove(s.mesh);s.mesh.geometry.dispose();s.mesh.material.dispose()}if(s.pts.length<2)return;const c=new T.Vector3();s.pts.forEach(p=>c.add(p));c.divideScalar(s.pts.length);const m=make('draw',{c:color,r:brush,pts:s.pts.map(p=>p.clone().sub(c).toArray())});m.position.copy(c);add(m)}
+// ---------- save / load ----------
+const ser=()=>({v:1,items:items.map(o=>({t:o.userData.t,c:o.userData.c,seed:o.userData.seed,pts:o.userData.pts,r:o.userData.r,p:o.position.toArray(),q:o.quaternion.toArray(),s:o.scale.toArray()}))});
+const num=a=>Array.isArray(a)&&a.every(Number.isFinite);
+function valid(d){if(!d||d.v!==1||!Array.isArray(d.items)||d.items.length>500)return false;return d.items.every(i=>i&&TYPES.includes(i.t)&&/^#[0-9a-f]{6}$/i.test(i.c)&&num(i.p)&&i.p.length===3&&num(i.q)&&i.q.length===4&&num(i.s)&&i.s.length===3&&(i.t!=='draw'||(Array.isArray(i.pts)&&i.pts.length>1&&i.pts.length<5000&&i.pts.every(p=>num(p)&&p.length===3)&&Number.isFinite(i.r)&&i.r>0&&i.r<.5)))}
+function clearAll(){items.slice().forEach(o=>{world.remove(o);o.geometry.dispose();o.material.dispose()});items.length=0;sel=hov=null;hist.length=redoS.length=0}
+function loadData(d){clearAll();for(const i of d.items){const m=make(i.t,i);m.position.fromArray(i.p);m.quaternion.fromArray(i.q);m.scale.fromArray(i.s);world.add(m);items.push(m)}}
+let mem={};
+const store={get(){try{return JSON.parse(localStorage.getItem('blobws')||'{}')}catch(e){return mem}},set(o){mem=o;try{localStorage.setItem('blobws',JSON.stringify(o))}catch(e){}}};
+function refreshSaved(){const k=Object.keys(store.get());$('sv').innerHTML=k.map(n=>`<option>${n}</option>`).join('')||'<option value="">(none saved)</option>'}
+function save(){const n=($('nm').value||'project').slice(0,40),o=store.get();o[n]=ser();store.set(o);refreshSaved();$('sv').value=n;beep(880,.15,'triangle',.2,400);msg('Saved "'+n+'"')}
+function load(){const o=store.get(),n=$('sv').value;if(o[n]&&valid(o[n])){loadData(o[n]);$('nm').value=n;msg('Loaded "'+n+'"')}else msg('Nothing to load')}
+function exportJSON(){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(ser())],{type:'application/json'}));a.download=($('nm').value||'project')+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),999)}
+$('imp').onchange=e=>{const f=e.target.files[0];if(!f)return;if(f.size>1e6){msg('File too large (>1 MB)');return}const r=new FileReader();r.onload=()=>{try{const d=JSON.parse(r.result);if(!valid(d))throw 0;loadData(d);msg('Imported '+d.items.length+' objects')}catch(x){msg('Rejected: not a valid project file')}};r.readAsText(f);e.target.value=''};
+// ---------- desktop HUD ----------
+const tb={};
+function setTool(id){tool=id;for(const k in tb)tb[k].classList.toggle('on',k===id);beep(600,.04,'square',.08)}
+TOOLS.forEach(([id,l])=>{const b=document.createElement('button');b.textContent=l;b.onclick=()=>setTool(id);$('tools').appendChild(b);tb[id]=b});
+const ACTS=[['Undo',undo],['Redo',redo],['Scale +',()=>xf(sel,o=>o.scale.multiplyScalar(1.2))],['Scale −',()=>xf(sel,o=>o.scale.multiplyScalar(1/1.2))],['Rotate',()=>xf(sel,o=>o.rotateY(Math.PI/4))]];
+ACTS.forEach(([l,f])=>{const b=document.createElement('button');b.textContent=l;b.onclick=f;$('acts').appendChild(b)});
+[['New',()=>{clearAll();msg('New project')}],['Save',save],['Load',load],['Delete',()=>{const o=store.get();delete o[$('sv').value];store.set(o);refreshSaved();msg('Deleted')}],['Export',exportJSON],['Import',()=>$('imp').click()]].forEach(([l,f])=>{const b=document.createElement('button');b.textContent=l;b.onclick=f;$('files').appendChild(b)});
+const setColor=c=>{color=c;$('col').value=c};
+PAL.forEach(c=>{const s=document.createElement('span');s.style.background=c;s.onclick=()=>setColor(c);$('pal').appendChild(s)});
+$('col').oninput=e=>color=e.target.value;$('br').oninput=e=>brush=e.target.value/1000;$('sn').onchange=e=>snapOn=e.target.checked;$('vol').oninput=e=>vol=e.target.value/100;
+refreshSaved();setTool('sphere');
+// ---------- VR world-space panel ----------
+const panel=new T.Group();panel.position.set(0,1.25,-.3);panel.rotation.x=-.25;S.add(panel);
+panel.add(Object.assign(new T.Mesh(new T.PlaneGeometry(.9,.52),new T.MeshBasicMaterial({color:0x1d1b3a})),{position:new T.Vector3(0,.0,-.02)}));
+const btns=[];
+function tex(l,bg){const c=document.createElement('canvas');c.width=256;c.height=128;const g=c.getContext('2d');g.fillStyle=bg;g.fillRect(0,0,256,128);g.fillStyle=bg.startsWith('#f')||bg==='#ffffff'?'#123':'#fff';g.font='bold 44px sans-serif';g.textAlign='center';g.textBaseline='middle';g.fillText(l,128,64);return new T.CanvasTexture(c)}
+function vbtn(i,l,bg,fn){const m=new T.Mesh(new T.BoxGeometry(.125,.0625,.02),new T.MeshBasicMaterial({map:tex(l,bg)}));m.position.set(-.35+i%6*.14,.19-Math.floor(i/6)*.09,0);m.userData.fn=fn;btns.push(m);panel.add(m)}
+let bi=0;
+TOOLS.forEach(([id,l])=>vbtn(bi++,l,'#3d3a6b',()=>setTool(id)));
+[['Undo',undo],['Redo',redo],['S+',ACTS[2][1]],['S−',ACTS[3][1]],['Rot',ACTS[4][1]],['Save',save],['Load',load]].forEach(([l,f])=>vbtn(bi++,l,'#5a4fcf',f));
+vbtn(bi++,'Exit VR','#c0392b',()=>{const s=R.xr.getSession();if(s)s.end()});
+PAL.forEach(c=>vbtn(bi++,'',c,()=>setColor(c)));
+vbtn(bi++,'Brush −','#2a7f62',()=>{brush=Math.max(.005,brush-.005);beep(300,.05)});vbtn(bi++,'Brush +','#2a7f62',()=>{brush=Math.min(.08,brush+.005);beep(500,.05)});
+// ---------- VR controllers ----------
+const tmp=new T.Matrix4(),rc=new T.Raycaster(),o3=new T.Vector3(),d3=new T.Vector3();
+function aim(c){c.getWorldPosition(o3);tmp.identity().extractRotation(c.matrixWorld);d3.set(0,0,-1).applyMatrix4(tmp);rc.set(o3,d3);rc.far=3}
+const pulse=c=>{try{c.userData.gp.hapticActuators[0].pulse(.4,40)}catch(e){}};
+const hitBtn=c=>{aim(c);return rc.intersectObjects(btns)[0]?.object};
+const ctrls=[0,1].map(i=>{const c=R.xr.getController(i);rig.add(c);
+ c.add(new T.Mesh(new T.SphereGeometry(.025,12,8),new T.MeshStandardMaterial({color:i?0xffcc00:0x33ccff})));
+ const l=new T.Line(new T.BufferGeometry().setFromPoints([new T.Vector3(),new T.Vector3(0,0,-1)]),new T.LineBasicMaterial({color:0xffffff}));l.scale.z=2;c.add(l);
+ c.userData={line:l,held:null,prev:new T.Vector3(),vel:new T.Vector3(),stroke:false};
+ c.addEventListener('connected',e=>c.userData.gp=e.data.gamepad);
+ c.addEventListener('selectstart',()=>trigDown(c));c.addEventListener('selectend',()=>{if(c.userData.stroke){c.userData.stroke=false;endStroke()}});
+ c.addEventListener('squeezestart',()=>grab(c));c.addEventListener('squeezeend',()=>drop(c));return c});
+function trigDown(c){const b=hitBtn(c);if(b){b.userData.fn();pulse(c);return}
+ if(TYPES.includes(tool)&&tool!=='draw'){const m=make(tool,{c:color,seed:Math.random()*9});m.position.copy(o3).addScaledVector(d3,.3);m.userData.dyn=true;add(m);pulse(c)}
+ else if(tool==='draw'){beginStroke();c.userData.stroke=true}
+ else{const o=rc.intersectObjects(items)[0]?.object;if(!o)return;pulse(c);if(tool==='select')select(o);else if(tool==='delete')rm(o);else if(tool==='recolor')recolor(o,color);else dup(o)}}
+function grab(c){c.getWorldPosition(o3);let b=null,bd=.3;for(const o of items){const d=o.position.distanceTo(o3);if(d<bd){bd=d;b=o}}if(!b)return;const u=c.userData;u.held=b;u.old=snapT(b);b.userData.dyn=false;c.attach(b);select(b);beep(350,.07,'square',.12);pulse(c)}
+function drop(c){const u=c.userData,o=u.held;if(!o)return;world.attach(o);const a=u.old,b=snapT(o);push(()=>applyT(o,a),()=>applyT(o,b));if(snapOn){o.position.x=Math.round(o.position.x/.1)*.1;o.position.z=Math.round(o.position.z/.1)*.1}o.userData.v.copy(u.vel);o.userData.dyn=true;u.held=null;beep(260,.08,'square',.12)}
+R.xr.addEventListener('sessionstart',()=>{rig.position.set(0,0,1.2);cam.position.set(0,0,0);cam.rotation.set(0,0,0);help.style.display='none'});
+R.xr.addEventListener('sessionend',()=>{rig.position.set(0,0,0);orbit();help.style.display=quest?'none':'';if(quest)splash()});
+const help=$('help'),vrb=$('vr');
+const quest=/OculusBrowser|Quest/i.test(navigator.userAgent);
+if(quest){$('hud').style.display='none';help.style.display='none'}
+function splash(err){let d=$('splash');if(!d){d=document.createElement('div');d.id='splash';d.style.cssText='position:fixed;inset:0;z-index:9;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;background:linear-gradient(#1d1b3a,#5a4fcf);color:#fff;font:600 30px system-ui,sans-serif;text-align:center;padding:24px';d.innerHTML='<div>🫧 VR support detected</div><div style="font-size:20px;font-weight:400">Want to launch Blob Workshop?</div><button id="go" style="font:700 28px system-ui;padding:18px 44px;border:0;border-radius:20px;background:#ff5c8a;color:#fff">Launch VR</button><button id="no" style="font:16px system-ui;background:none;border:0;color:#ddd;text-decoration:underline">Stay in browser</button><div id="serr" style="font:14px system-ui;color:#ffd166;max-width:520px"></div>';document.body.appendChild(d);$('go').onclick=()=>startVR().then(()=>d.remove()).catch(e=>{$('serr').textContent='Could not start VR: '+e.message+' — open the link directly in Meta Quest Browser (not an embedded preview).'});$('no').onclick=()=>{d.remove();$('hud').style.display=''}}}
+if(navigator.xr){let done=0;const fin=ok=>{if(done)return;done=1;vrb.disabled=!ok;vrb.textContent=ok?'Enter VR':'VR headset not available';if(ok)splash();else msg('No immersive VR here — desktop mode. For Quest, open this page via HTTPS in Meta Quest Browser.')};navigator.xr.isSessionSupported('immersive-vr').then(ok=>fin(ok||quest)).catch(()=>fin(quest));setTimeout(()=>fin(quest),2500)}
+else{vrb.textContent='WebXR unsupported';msg('This browser lacks WebXR — desktop mode only.')}
+function startVR(){return navigator.xr.requestSession('immersive-vr',{optionalFeatures:['local-floor','bounded-floor']}).then(s=>{R.xr.setReferenceSpaceType('local-floor');return R.xr.setSession(s)})}
+vrb.onclick=()=>startVR().catch(e=>msg('Could not start VR: '+e.message+' (embedded views may block it; open the page directly)'));
+// ---------- desktop pointer ----------
+const ray=new T.Raycaster(),mouse=new T.Vector2(),fp=new T.Plane(new T.Vector3(0,1,0),0),hv=new T.Vector3();
+let drag=null;const cv=R.domElement;
+function setRay(e){const r=cv.getBoundingClientRect();mouse.set((e.clientX-r.left)/r.width*2-1,-(e.clientY-r.top)/r.height*2+1);ray.setFromCamera(mouse,cam)}
+const pick=()=>ray.intersectObjects(items)[0]?.object;
+const sn=v=>snapOn?Math.round(v/.1)*.1:v;
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+cv.addEventListener('pointerdown',e=>{if(R.xr.isPresenting)return;cv.setPointerCapture(e.pointerId);
+ if(e.button!==0){drag={m:'orbit'};return}
+ setRay(e);const b=ray.intersectObjects(btns)[0]?.object;if(b){b.userData.fn();return}
+ const o=pick();
+ if(tool==='select'){select(o||null);drag=o?{m:'move',o,old:snapT(o),pl:new T.Plane(new T.Vector3(0,1,0),-o.position.y)}:{m:'orbit'};if(o)beep(400,.05)}
+ else if(tool==='delete'){if(o)rm(o)}
+ else if(tool==='recolor'){if(o)recolor(o,color)}
+ else if(tool==='dup'){if(o)dup(o)}
+ else if(tool==='draw'){beginStroke();const n=cam.getWorldDirection(new T.Vector3());drag={m:'draw',pl:new T.Plane().setFromNormalAndCoplanarPoint(n,tgt)};if(ray.ray.intersectPlane(drag.pl,hv))strokeAdd(hv)}
+ else if(ray.ray.intersectPlane(fp,hv)){const m=make(tool,{c:color,seed:Math.random()*9});m.position.set(sn(hv.x),.16,sn(hv.z));add(m)}});
+cv.addEventListener('pointermove',e=>{if(R.xr.isPresenting)return;
+ if(!drag){setRay(e);const o=pick(),p=hov;hov=o||null;glow(p);glow(hov);return}
+ if(drag.m==='orbit'){yaw-=e.movementX*.006;pit=Math.max(.05,Math.min(1.4,pit+e.movementY*.006))}
+ else{setRay(e);if(ray.ray.intersectPlane(drag.pl,hv)){if(drag.m==='move'){drag.o.position.x=sn(hv.x);drag.o.position.z=sn(hv.z)}else strokeAdd(hv)}}});
+cv.addEventListener('pointerup',()=>{if(drag&&drag.m==='draw')endStroke();if(drag&&drag.m==='move'){const o=drag.o,a=drag.old,b=snapT(o);push(()=>applyT(o,a),()=>applyT(o,b))}drag=null});
+cv.addEventListener('wheel',e=>{dist=Math.max(1,Math.min(14,dist+e.deltaY*.003))},{passive:true});
+addEventListener('keydown',e=>{if(e.target.tagName==='INPUT')return;if(e.key==='z'&&(e.ctrlKey||e.metaKey))undo();else if(e.key==='y'&&(e.ctrlKey||e.metaKey))redo();else if(e.key==='Delete'&&sel)rm(sel)});
+addEventListener('resize',()=>{cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix();R.setSize(innerWidth,innerHeight)});
+// ---------- loop ----------
+const clock=new T.Clock(),bb=new T.Box3();
+R.setAnimationLoop(()=>{const dt=Math.min(clock.getDelta(),.05);
+ for(let i=anims.length-1;i>=0;i--){const a=anims[i];a.t+=dt*5;const k=Math.min(1,a.t);a.m.scale.copy(a.s).multiplyScalar(.1+.9*(1-Math.pow(1-k,3)));if(k>=1)anims.splice(i,1)}
+ for(const o of items){const u=o.userData;if(!u.dyn||o.parent!==world)continue;u.v.y-=9.8*dt;o.position.addScaledVector(u.v,dt);o.position.x=Math.max(-25,Math.min(25,o.position.x));o.position.z=Math.max(-25,Math.min(25,o.position.z));bb.setFromObject(o);if(bb.min.y<0){o.position.y-=bb.min.y;if(Math.abs(u.v.y)>.5){u.v.y*=-.35;u.v.x*=.8;u.v.z*=.8}else{u.v.set(0,0,0);u.dyn=false}}}
+ if(R.xr.isPresenting){btns.forEach(b=>b.scale.setScalar(1));
+  for(const c of ctrls){const u=c.userData;c.getWorldPosition(o3);u.vel.lerp(d3.copy(o3).sub(u.prev).divideScalar(Math.max(dt,.001)),.3);u.prev.copy(o3);
+   const b=hitBtn(c);if(b)b.scale.setScalar(1.15);u.line.material.color.set(b?0xffee00:rc.intersectObjects(items).length?0x66ff66:0xffffff);
+   if(u.stroke){c.getWorldPosition(o3);strokeAdd(o3)}}}
+ else orbit();
+ R.render(S,cam)});
+</script></body></html>
